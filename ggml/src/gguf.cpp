@@ -278,7 +278,7 @@ struct gguf_reader {
             return false;
         }
         dst.resize(size);
-        return fread(dst.data(), 1, dst.length(), file) == dst.length();
+        return fread(&dst[0], 1, dst.length(), file) == dst.length();
     }
 
     bool read(void * dst, const size_t size) const {

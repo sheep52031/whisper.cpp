@@ -3742,7 +3742,7 @@ static void ggml_compute_forward_swiglu_oai_f32(
 
         for (int k = 0; k < nc; k++) {
             const float x = std::min(src0_p[k], limit);
-            const float y = std::clamp(src1_p[k], -limit, limit);
+            const float y = std::max(-limit, std::min(src1_p[k], limit));
             const float out_glu = x / (1.f + expf(alpha * (-x)));
             dst_p[k] = out_glu * (y + 1.f);
         }

@@ -165,8 +165,22 @@ static bool ggml_graph_compute_helper(
          ggml_abort_callback   abort_callback,
                         void * abort_callback_data) {
     ggml_backend_ptr backend { ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr) };
+    if (!backend) {
+        WHISPER_LOG_ERROR("%s: failed to initialize CPU backend\n", __func__);
+        return false;
+    }
 
-    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+    ggml_backend_dev_t device = ggml_backend_get_device(backend.get());
+    if (!device) {
+        WHISPER_LOG_ERROR("%s: failed to get backend device\n", __func__);
+        return false;
+    }
+
+    auto * reg = ggml_backend_dev_backend_reg(device);
+    if (!reg) {
+        WHISPER_LOG_ERROR("%s: failed to get backend registry\n", __func__);
+        return false;
+    }
 
     auto * set_abort_callback_fn = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
     if (set_abort_callback_fn) {
@@ -1344,6 +1358,13 @@ static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params & pa
     }
 
     WHISPER_LOG_INFO("%s: using %s backend\n", __func__, ggml_backend_dev_name(dev));
+
+    // Check if device is valid before initialization
+    if (!dev) {
+        WHISPER_LOG_ERROR("%s: invalid device pointer\n", __func__);
+        return nullptr;
+    }
+
     ggml_backend_t result = ggml_backend_dev_init(dev, nullptr);
     if (!result) {
         WHISPER_LOG_ERROR("%s: failed to initialize %s backend\n", __func__, ggml_backend_dev_name(dev));
@@ -1366,6 +1387,13 @@ static std::vector<ggml_backend_t> whisper_backend_init(const whisper_context_pa
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
             WHISPER_LOG_INFO("%s: using %s backend\n", __func__, ggml_backend_dev_name(dev));
+
+            // Check if device is valid before initialization
+            if (!dev) {
+                WHISPER_LOG_ERROR("%s: invalid device pointer at index %d\n", __func__, i);
+                continue;
+            }
+
             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             if (!backend) {
                 WHISPER_LOG_ERROR("%s: failed to initialize %s backend\n", __func__, ggml_backend_dev_name(dev));
@@ -2019,13 +2047,21 @@ static struct ggml_cgraph * whisper_build_graph_conv(
 
     ggml_cgraph * gf = ggml_new_graph(ctx0);
 
-    struct ggml_tensor * mel = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2*n_ctx, n_mels);
+    const bool use_external_encoder = whisper_encode_external(wstate);
+    // 🔧 FIX: 統一使用 2*n_ctx 以符合 CoreML 模型期望
+    // Breeze-ASR-25 使用 conv_stride=2，需要 mel_length=2*n_ctx=3000
+    // 移除條件判斷以確保 CoreML 和 GGML 路徑使用相同尺寸
+    const int mel_width = 2*n_ctx;  // 總是 3000 for n_ctx=1500
+
+    WHISPER_LOG_INFO("whisper_build_graph_conv: use_external=%d, mel_width=%d (unified 2*n_ctx)\n", use_external_encoder ? 1 : 0, mel_width);
+
+    struct ggml_tensor * mel = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, mel_width, n_mels);
     ggml_set_name(mel, "mel");
     ggml_set_input(mel);
 
     struct ggml_tensor * cur = nullptr;
 
-    if (!whisper_encode_external(wstate)) {
+    if (!use_external_encoder) {
         // convolution + gelu
         {
             cur = ggml_conv_1d_ph(ctx0, model.e_conv_1_w, mel, 1, 1);
@@ -2406,6 +2442,12 @@ static bool whisper_encode_internal(
         {
             const auto & mel_inp = wstate.mel;
             const int n_ctx      = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : wctx.model.hparams.n_audio_ctx;
+            const bool use_external_encoder = whisper_encode_external(wstate);
+            // 🔧 FIX: Breeze-ASR-25 CoreML encoder expects 2*n_ctx (3000) not n_ctx (1500)
+            // Standard Whisper: conv_stride=4, mel_length=6000, but Breeze uses conv_stride=2, mel_length=3000
+            const int copy_width = 2*n_ctx;  // Always use 2*n_ctx for both CoreML and GGML
+
+            WHISPER_LOG_INFO("mel_copy: mel_inp.n_len=%d, copy_width=%d, mel_offset=%d\n", mel_inp.n_len, copy_width, mel_offset);
 
             assert(mel->type == GGML_TYPE_F32);
             assert(mel_inp.n_mel == wctx.model.hparams.n_mels);
@@ -2415,12 +2457,15 @@ static bool whisper_encode_internal(
             float * dst = wstate.inp_mel.data();
             memset(dst, 0, ggml_nbytes(mel));
 
-            const int i0 = std::min(mel_offset,           mel_inp.n_len);
-            const int i1 = std::min(mel_offset + 2*n_ctx, mel_inp.n_len);
+            const int i0 = std::min(mel_offset,              mel_inp.n_len);
+            const int i1 = std::min(mel_offset + copy_width, mel_inp.n_len);
 
             for (int j = 0; j < mel_inp.n_mel; ++j) {
                 for (int i = i0; i < i1; ++i) {
-                    dst[j*2*n_ctx + (i - i0)] = mel_inp.data[j*mel_inp.n_len + i];
+                    const int col = i - i0;
+                    if (col < copy_width) {
+                        dst[j*copy_width + col] = mel_inp.data[j*mel_inp.n_len + i];
+                    }
                 }
             }
 
@@ -3203,15 +3248,24 @@ static bool log_mel_spectrogram(
               const int   n_threads,
               const whisper_filters & filters,
               const bool   debug,
-              whisper_mel & mel) {
+              whisper_mel & mel,
+              const int   audio_ctx_override = 0) {
     const int64_t t_start_us = ggml_time_us();
 
     // Hann window
     WHISPER_ASSERT(frame_size == WHISPER_N_FFT && "Unsupported frame_size");
     const float * hann = global_cache.hann_window;
 
-    // Calculate the length of padding
-    int64_t stage_1_pad = WHISPER_SAMPLE_RATE * 30;
+    // Calculate the length of padding so that the resulting mel frames
+    // exactly match the desired audio context when provided.
+    int64_t stage_1_pad = 0;
+    if (audio_ctx_override > 0) {
+        const int64_t target_samples = (int64_t) audio_ctx_override * frame_step;
+        stage_1_pad = std::max<int64_t>(0, target_samples - n_samples);
+    } else {
+        // Default to 30 seconds of audio when no override is specified
+        stage_1_pad = (int64_t) WHISPER_SAMPLE_RATE * 30;
+    }
     int64_t stage_2_pad = frame_size / 2;
 
     // Initialize a vector and copy data from C array to it.
@@ -3219,7 +3273,7 @@ static bool log_mel_spectrogram(
     samples_padded.resize(n_samples + stage_1_pad + stage_2_pad * 2);
     std::copy(samples, samples + n_samples, samples_padded.begin() + stage_2_pad);
 
-    // pad 30 seconds of zeros at the end of audio (480,000 samples) + reflective pad 200 samples at the end of audio
+    // pad target_seconds of zeros at the end of audio + reflective pad 200 samples at the end of audio
     std::fill(samples_padded.begin() + n_samples + stage_2_pad, samples_padded.begin() + n_samples + stage_1_pad + 2 * stage_2_pad, 0);
 
     // reflective pad 200 samples at the beginning of audio
@@ -3247,6 +3301,41 @@ static bool log_mel_spectrogram(
 
         for (int iw = 0; iw < n_threads - 1; ++iw) {
             workers[iw].join();
+        }
+    }
+
+    // If an audio context override is provided ensure the mel spectrogram
+    // length matches it exactly so downstream CoreML / decoder consumers
+    // receive the expected frame count.
+    if (audio_ctx_override > 0) {
+        const int target_len = audio_ctx_override;
+        const int current_len = mel.n_len;
+
+        if (current_len > target_len) {
+            std::vector<float> trimmed(mel.n_mel * target_len);
+            for (int j = 0; j < mel.n_mel; ++j) {
+                const float * src = mel.data.data() + j * current_len;
+                float * dst = trimmed.data() + j * target_len;
+                std::copy(src, src + target_len, dst);
+            }
+            mel.data.swap(trimmed);
+            mel.n_len = target_len;
+            mel.n_len_org = target_len;
+        } else if (current_len < target_len) {
+            // Pad with the minimum log-mel value (silence) to reach target length
+            const int old_len = current_len;
+            mel.data.resize(mel.n_mel * target_len);
+            const float pad_value = std::log10(1e-10f);
+            for (int j = 0; j < mel.n_mel; ++j) {
+                float * dst = mel.data.data() + j * target_len;
+                if (old_len > 0) {
+                    std::fill(dst + old_len, dst + target_len, pad_value);
+                } else {
+                    std::fill(dst, dst + target_len, pad_value);
+                }
+            }
+            mel.n_len = target_len;
+            mel.n_len_org = target_len;
         }
     }
 
@@ -3898,7 +3987,9 @@ void whisper_free_params(struct whisper_full_params * params) {
 }
 
 int whisper_pcm_to_mel_with_state(struct whisper_context * ctx, struct whisper_state * state, const float * samples, int n_samples, int n_threads) {
-    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH, ctx->model.filters.n_mel, n_threads, ctx->model.filters, false, state->mel)) {
+    // Use exp_n_audio_ctx if set, otherwise use model's default
+    int audio_ctx = state->exp_n_audio_ctx > 0 ? state->exp_n_audio_ctx : ctx->model.hparams.n_audio_ctx;
+    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH, ctx->model.filters.n_mel, n_threads, ctx->model.filters, false, state->mel, audio_ctx)) {
         WHISPER_LOG_ERROR("%s: failed to compute mel spectrogram\n", __func__);
         return -1;
     }
@@ -4209,6 +4300,27 @@ int whisper_n_text_ctx(struct whisper_context * ctx) {
 
 int whisper_n_audio_ctx(struct whisper_context * ctx) {
     return ctx->model.hparams.n_audio_ctx;
+}
+
+int whisper_set_audio_ctx(struct whisper_context * ctx, int n_audio_ctx) {
+    if (n_audio_ctx < 0) {
+        WHISPER_LOG_ERROR("%s: invalid audio_ctx: %d\n", __func__, n_audio_ctx);
+        return -1;
+    }
+
+    if (n_audio_ctx > 0 && n_audio_ctx > ctx->model.hparams.n_audio_ctx) {
+        WHISPER_LOG_ERROR("%s: audio_ctx (%d) is larger than model's maximum (%d)\n",
+                         __func__, n_audio_ctx, ctx->model.hparams.n_audio_ctx);
+        return -1;
+    }
+
+    // Set for the default state
+    ctx->state->exp_n_audio_ctx = n_audio_ctx;
+
+    WHISPER_LOG_INFO("%s: set audio_ctx to %d (model max: %d)\n",
+                    __func__, n_audio_ctx, ctx->model.hparams.n_audio_ctx);
+
+    return 0;
 }
 
 int whisper_is_multilingual(struct whisper_context * ctx) {
@@ -6807,6 +6919,9 @@ int whisper_full_with_state(
     struct whisper_full_params   params,
                    const float * samples,
                            int   n_samples) {
+    // 🔍 Performance timing: start
+    const auto t_start_full = ggml_time_us();
+
     // clear old results
     auto & result_all = state->result_all;
 
@@ -6814,10 +6929,13 @@ int whisper_full_with_state(
 
     if (n_samples > 0) {
         // compute log mel spectrogram
+        const auto t_start_mel = ggml_time_us();
         if (whisper_pcm_to_mel_with_state(ctx, state, samples, n_samples, params.n_threads) != 0) {
             WHISPER_LOG_ERROR("%s: failed to compute log mel spectrogram\n", __func__);
             return -2;
         }
+        const auto t_end_mel = ggml_time_us();
+        WHISPER_LOG_INFO("🔍 [TIMING] mel_spectrogram: %.3f s\n", (t_end_mel - t_start_mel) / 1e6);
     }
 
     // auto-detect language if not specified
@@ -7013,10 +7131,13 @@ int whisper_full_with_state(
         }
 
         // encode audio features starting at offset seek
+        const auto t_start_encode = ggml_time_us();
         if (!whisper_encode_internal(*ctx, *state, seek, params.n_threads, params.abort_callback, params.abort_callback_user_data)) {
             WHISPER_LOG_ERROR("%s: failed to encode\n", __func__);
             return -6;
         }
+        const auto t_end_encode = ggml_time_us();
+        WHISPER_LOG_INFO("🔍 [TIMING] encode: %.3f s\n", (t_end_encode - t_start_encode) / 1e6);
 
         // if there is a very short audio segment left to process, we remove any past prompt since it tends
         // to confuse the decoder and often make it repeat or hallucinate stuff
@@ -7102,7 +7223,8 @@ int whisper_full_with_state(
 
                 // recreate the KV cache if the number of decoders has changed
                 if (state->kv_self_n_dec < n_decoders_cur) {
-                    WHISPER_LOG_DEBUG("%s: recreating KV cache: n_decoders_cur = %d\n", __func__, n_decoders_cur);
+                    const auto t_start_kv = ggml_time_us();
+                    WHISPER_LOG_INFO("🔍 [TIMING] KV cache recreation triggered: kv_self_n_dec=%d -> %d\n", state->kv_self_n_dec, n_decoders_cur);
 
                     whisper_kv_cache_free(state->kv_self);
 
@@ -7119,16 +7241,21 @@ int whisper_full_with_state(
                     }
 
                     state->kv_self_n_dec = n_decoders_cur;
+                    const auto t_end_kv = ggml_time_us();
+                    WHISPER_LOG_INFO("🔍 [TIMING] KV cache recreation: %.3f s\n", (t_end_kv - t_start_kv) / 1e6);
                 }
 
                 whisper_kv_cache_clear(state->kv_self);
 
                 whisper_batch_prep_legacy(state->batch, prompt.data(), prompt.size(), 0, 0);
 
+                const auto t_start_decode_init = ggml_time_us();
                 if (!whisper_decode_internal(*ctx, *state, state->batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
                     WHISPER_LOG_ERROR("%s: failed to decode\n", __func__);
                     return -8;
                 }
+                const auto t_end_decode_init = ggml_time_us();
+                WHISPER_LOG_INFO("🔍 [TIMING] decode_initial: %.3f s\n", (t_end_decode_init - t_start_decode_init) / 1e6);
 
                 // Calculate no_speech probability after first decode.
                 // This has to be done before any logit filtering. Hence we cannot use the probs from the whisper_process_logits.
@@ -7715,6 +7842,10 @@ int whisper_full_with_state(
             WHISPER_LOG_DEBUG("seek = %d, seek_delta = %d\n", seek, seek_delta);
         }
     }
+
+    // 🔍 Performance timing: total
+    const auto t_end_full = ggml_time_us();
+    WHISPER_LOG_INFO("🔍 [TIMING] whisper_full_with_state TOTAL: %.3f s\n", (t_end_full - t_start_full) / 1e6);
 
     return 0;
 }

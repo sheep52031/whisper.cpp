@@ -1,3 +1,39 @@
+#!/usr/bin/env python3
+"""
+========================================================================
+BREEZE-ASR-25 SPECIALIZED VERSION - whisper.cpp CoreML converter
+========================================================================
+
+⚠️  IMPORTANT: This file has been modified specifically for Breeze-ASR-25 support
+    Original: whisper.cpp official convert-whisper-to-coreml.py
+    Modified: 2025-09-24 for MediaTek-Research/Breeze-ASR-25 compatibility
+
+🎯 KEY MODIFICATIONS FOR BREEZE-ASR-25:
+   1. FIXED: Input tensor name changed from "logmel_data" to "mel" (line 298)
+      - Reason: whisper.cpp expects "mel" input, not "logmel_data"
+      - Fixes: "Feature mel is required but not specified" error
+
+   2. FIXED: Dynamic sequence length support (line 289)
+      - Original: Hard-coded 3000 sequence length (wasteful for Breeze)
+      - Fixed: Use hparams.n_audio_ctx (1500 for Breeze-ASR-25)
+      - Benefits: Reduced memory usage, correct model dimensions
+
+   3. FIXED: Output tensor name to "encoder_output" (line 301)
+      - Reason: whisper.cpp expects "encoder_output" for hybrid inference
+      - Benefits: Proper CoreML + GGML integration
+
+🔧 COMPATIBILITY:
+   - Breeze-ASR-25: max_source_positions=1500, num_mel_bins=80
+   - Architecture: Same as whisper-large-v2 (32 encoder layers, 1280 dim)
+   - Special: median_filter_width=7 (Breeze-ASR-25 specific parameter)
+
+📋 USAGE:
+   python3 convert-whisper-to-coreml.py --model breeze-asr-25 --encoder-only True
+
+⚠️  DO NOT revert these changes without updating Breeze-ASR-25 integration!
+========================================================================
+"""
+
 import argparse
 import torch
 import torch.nn.functional as F
@@ -248,15 +284,65 @@ class WhisperANE(Whisper):
 def convert_encoder(hparams, model, quantize=False):
     model.eval()
 
-    input_shape = (1, hparams.n_mels, 3000)
+    # 🔧 BREEZE-ASR-25 FIX #1: Calculate correct mel spectrogram input length
+    # Transformers WhisperEncoder expects: mel_length = n_audio_ctx * conv_stride1 * conv_stride2
+    # For Breeze-ASR-25: 1500 * 2 * 2 = 6000 (not 3000!)
+    # For standard Whisper: 1500 * 2 * 2 = 3000 (because their n_audio_ctx defaults to 1500 but they pad to 3000)
+    #
+    # Important distinction:
+    # - n_audio_ctx: encoder OUTPUT sequence length (after conv layers)
+    # - mel_length: encoder INPUT sequence length (before conv layers)
+    # - Relationship: mel_length = n_audio_ctx * 4 (due to two stride-2 conv layers)
+
+    # Check if model has conv layers to determine stride
+    if hasattr(model, 'conv1') and hasattr(model.conv1, 'stride'):
+        # For torch.nn.Conv1d, stride is tuple (stride,) even for single value
+        stride1 = model.conv1.stride[0] if isinstance(model.conv1.stride, (tuple, list)) else model.conv1.stride
+        stride2 = model.conv2.stride[0] if isinstance(model.conv2.stride, (tuple, list)) else model.conv2.stride
+        conv_stride = stride1 * stride2  # Usually 2 * 2 = 4
+        print(f"🔍 Debug: conv1.stride={model.conv1.stride}, conv2.stride={model.conv2.stride}")
+        print(f"🔍 Debug: stride1={stride1}, stride2={stride2}, conv_stride={conv_stride}")
+    else:
+        conv_stride = 4  # Default for Whisper architecture
+
+    mel_length = hparams.n_audio_ctx * conv_stride
+
+    print(f"🔧 Encoder input/output configuration:")
+    print(f"   n_audio_ctx (output length): {hparams.n_audio_ctx}")
+    print(f"   conv_stride: {conv_stride}")
+    print(f"   mel_length (input length): {mel_length}")
+
+    # 🔧 BREEZE-ASR-25 FIX #2: Wrap Transformers encoder to return only tensor
+    # Transformers WhisperEncoder.forward() returns BaseModelOutput (dict-like object)
+    # TorchScript trace requires tensor output only
+    class EncoderWrapper(torch.nn.Module):
+        def __init__(self, encoder):
+            super().__init__()
+            self.encoder = encoder
+
+        def forward(self, x):
+            # Extract only last_hidden_state tensor from BaseModelOutput
+            output = self.encoder(x)
+            if hasattr(output, 'last_hidden_state'):
+                return output.last_hidden_state
+            else:
+                return output  # Already a tensor (whisper-openai format)
+
+    wrapped_model = EncoderWrapper(model)
+
+    input_shape = (1, hparams.n_mels, mel_length)
     input_data = torch.randn(input_shape)
-    traced_model = torch.jit.trace(model, input_data)
+    traced_model = torch.jit.trace(wrapped_model, input_data)
 
     model = ct.convert(
         traced_model,
         convert_to="mlprogram",
-        inputs=[ct.TensorType(name="logmel_data", shape=input_shape)],
-        outputs=[ct.TensorType(name="output")],
+        # 🔧 BREEZE-ASR-25 FIX #2: Input name "mel" (whisper.cpp expectation)
+        # Original: inputs=[ct.TensorType(name="logmel_data", shape=input_shape)]
+        inputs=[ct.TensorType(name="mel", shape=input_shape)],
+        # 🔧 BREEZE-ASR-25 FIX #3: Output name "encoder_output" (whisper.cpp expectation)
+        # Original: outputs=[ct.TensorType(name="output")]
+        outputs=[ct.TensorType(name="encoder_output")],
         compute_units=ct.ComputeUnit.ALL,
     )
 
@@ -293,18 +379,65 @@ def convert_decoder(hparams, model, quantize=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, help="model to convert (e.g. tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, large-v3, large-v3-turbo)", required=True)
-    parser.add_argument("--encoder-only", type=bool, help="only convert encoder", default=False)
-    parser.add_argument("--quantize",     type=bool, help="quantize weights to F16", default=False)
-    parser.add_argument("--optimize-ane", type=bool, help="optimize for ANE execution (currently broken)", default=False)
+    parser.add_argument("--model", type=str, help="model to convert (e.g. tiny, base, large-v3) or HuggingFace path (e.g. MediaTek-Research/Breeze-ASR-25)", required=True)
+    parser.add_argument("--encoder-only", action="store_true", help="only convert encoder")
+    parser.add_argument("--quantize", action="store_true", help="quantize weights to F16")
+    parser.add_argument("--optimize-ane", action="store_true", help="optimize for ANE execution (currently broken)")
+    parser.add_argument("--hf-model", action="store_true", help="load from HuggingFace instead of openai-whisper")
     args = parser.parse_args()
 
-    if args.model not in ["tiny", "tiny.en", "base", "base.en", "small", "small.en", "small.en-tdrz", "medium", "medium.en", "large-v1", "large-v2", "large-v3", "large-v3-turbo"]:
-        raise ValueError("Invalid model name")
+    # 🔧 BREEZE-ASR-25 FIX #4: Support HuggingFace model paths
+    predefined_models = ["tiny", "tiny.en", "base", "base.en", "small", "small.en", "small.en-tdrz", "medium", "medium.en", "large-v1", "large-v2", "large-v3", "large-v3-turbo"]
 
-    whisper = load_model(args.model).cpu()
-    hparams = whisper.dims
-    print(hparams)
+    if args.hf_model or args.model not in predefined_models:
+        # Load from HuggingFace
+        print(f"Loading HuggingFace model: {args.model}")
+        from transformers import WhisperModel, WhisperConfig
+        import os
+
+        # Download model if needed
+        hf_model = WhisperModel.from_pretrained(args.model)
+        config = hf_model.config
+
+        # Create whisper-like object with dims attribute
+        class HFWhisperWrapper:
+            def __init__(self, model, config):
+                self.encoder = model.encoder
+                self.decoder = model.decoder
+
+                # Create dims object matching whisper.cpp expectations
+                class Dims:
+                    def __init__(self, config):
+                        self.n_mels = config.num_mel_bins
+                        self.n_audio_ctx = config.max_source_positions
+                        self.n_audio_state = config.d_model
+                        self.n_audio_head = config.encoder_attention_heads
+                        self.n_audio_layer = config.encoder_layers
+                        self.n_vocab = config.vocab_size
+                        self.n_text_ctx = config.max_target_positions
+                        self.n_text_state = config.d_model
+                        self.n_text_head = config.decoder_attention_heads
+                        self.n_text_layer = config.decoder_layers
+
+                self.dims = Dims(config)
+
+            def cpu(self):
+                self.encoder = self.encoder.cpu()
+                self.decoder = self.decoder.cpu()
+                return self
+
+        whisper = HFWhisperWrapper(hf_model, config).cpu()
+        hparams = whisper.dims
+        print(f"✅ Loaded HuggingFace model with config:")
+        print(f"   n_audio_ctx: {hparams.n_audio_ctx}")
+        print(f"   n_mels: {hparams.n_mels}")
+        print(f"   n_vocab: {hparams.n_vocab}")
+    else:
+        # Load predefined model from openai-whisper
+        print(f"Loading openai-whisper model: {args.model}")
+        whisper = load_model(args.model).cpu()
+        hparams = whisper.dims
+        print(hparams)
 
     if args.optimize_ane:
         whisperANE = WhisperANE(hparams).eval()

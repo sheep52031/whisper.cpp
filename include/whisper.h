@@ -395,6 +395,12 @@ extern "C" {
     WHISPER_API int whisper_n_audio_ctx     (struct whisper_context * ctx);
     WHISPER_API int whisper_is_multilingual (struct whisper_context * ctx);
 
+    // Set audio context length for inference (0 = use model default)
+    // Must be called before whisper_full() or whisper_pcm_to_mel()
+    // Allows models with smaller n_audio_ctx (like Breeze-ASR-25 with 1500)
+    // to work correctly instead of being padded to 30 seconds (3000 frames)
+    WHISPER_API int whisper_set_audio_ctx(struct whisper_context * ctx, int n_audio_ctx);
+
     WHISPER_API int whisper_model_n_vocab      (struct whisper_context * ctx);
     WHISPER_API int whisper_model_n_audio_ctx  (struct whisper_context * ctx);
     WHISPER_API int whisper_model_n_audio_state(struct whisper_context * ctx);

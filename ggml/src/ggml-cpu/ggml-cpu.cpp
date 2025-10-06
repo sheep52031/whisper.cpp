@@ -4,7 +4,9 @@
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
 #include "amx/amx.h"
+#endif
 
 #include <cctype>
 #include <string>

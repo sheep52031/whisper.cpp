@@ -1,9 +1,12 @@
+// ⚡ 強制啟用 BF16 + Flash Attention（針對 Breeze-ASR-25 優化）
+#define GGML_METAL_USE_BF16 1
+
 #define GGML_COMMON_DECL_METAL
 #define GGML_COMMON_IMPL_METAL
 #if defined(GGML_METAL_EMBED_LIBRARY)
 __embed_ggml-common.h__
 #else
-#include "ggml-common.h"
+#include "../ggml-common.h"
 #endif
 #include "ggml-metal-impl.h"
 
@@ -23,6 +26,13 @@ using namespace metal;
 //   .../usr/bin/metal -dM -E -c                             ggml/src/ggml-metal/ggml-metal.metal
 //   .../usr/bin/metal -dM -E -c -target air64-apple-ios14.0 ggml/src/ggml-metal/ggml-metal.metal
 //
+
+// ⚡ 強制啟用 BF16 支援（針對 Breeze-ASR-25 + M2 優化）
+// M2 支援 Metal 3.1+ 和 bfloat 類型
+#ifndef GGML_METAL_USE_BF16
+#define GGML_METAL_USE_BF16 1
+#endif
+
 #if __METAL_VERSION__ < 310 && defined(GGML_METAL_USE_BF16)
 #undef GGML_METAL_USE_BF16
 #endif

@@ -1,5 +1,23 @@
 #import "ggml-metal.h"
 
+// ⚡ 強制啟用 BF16 支援（針對 Breeze-ASR-25 優化）
+#ifndef GGML_METAL_USE_BF16
+#define GGML_METAL_USE_BF16 1
+#endif
+
+// ARC compatibility macros
+#if __has_feature(objc_arc)
+#define GGML_METAL_RETAIN(obj) obj
+#define GGML_METAL_RELEASE(obj)
+#define GGML_METAL_AUTORELEASE(obj) obj
+#define GGML_METAL_RETAIN_RETURN(obj) obj
+#else
+#define GGML_METAL_RETAIN(obj) [obj retain]
+#define GGML_METAL_RELEASE(obj) [obj release]
+#define GGML_METAL_AUTORELEASE(obj) [obj autorelease]
+#define GGML_METAL_RETAIN_RETURN(obj) [obj retain]
+#endif
+
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
 #import "ggml-metal-impl.h"
@@ -150,17 +168,17 @@ static void ggml_backend_metal_device_rel(struct ggml_backend_metal_device_conte
         }
 
         if (ctx->mtl_lock) {
-            [ctx->mtl_lock release];
+            GGML_METAL_RELEASE(ctx->mtl_lock);
             ctx->mtl_lock = nil;
         }
 
         if (ctx->mtl_library) {
-            [ctx->mtl_library release];
+            GGML_METAL_RELEASE(ctx->mtl_library);
             ctx->mtl_library = nil;
         }
 
         if (ctx->mtl_device) {
-            [ctx->mtl_device release];
+            GGML_METAL_RELEASE(ctx->mtl_device);
             ctx->mtl_device = nil;
         }
     }
@@ -642,7 +660,7 @@ static struct ggml_metal_heap * ggml_metal_heap_init(id<MTLDevice> device, size_
         return false;
     }
 
-    [desc release];
+    GGML_METAL_RELEASE(desc);
 
     heap->bufs = [[NSMutableArray alloc] init];
 
@@ -660,7 +678,7 @@ static void ggml_metal_heap_reset(struct ggml_metal_heap * heap) {
     }
 
     for (id<MTLBuffer> buf in heap->bufs) {
-        [buf release];
+        GGML_METAL_RELEASE(buf);
     }
     [heap->bufs removeAllObjects];
 
@@ -676,8 +694,8 @@ static void ggml_metal_heap_free(struct ggml_metal_heap * heap) {
 
     ggml_metal_heap_reset(heap);
 
-    [heap->obj  release];
-    [heap->bufs release];
+    GGML_METAL_RELEASE(heap->obj);
+    GGML_METAL_RELEASE(heap->bufs);
 
     free(heap);
 }
@@ -734,10 +752,10 @@ static void ggml_metal_mem_pool_free(struct ggml_metal_mem_pool * mem_pool) {
         size_all += [ptr.data->obj size];
 
         ggml_metal_heap_free(ptr.data);
-        [ptr release];
+        GGML_METAL_RELEASE(ptr);
     }
-    [mem_pool->heaps           release];
-    [mem_pool->heaps_to_remove release];
+    GGML_METAL_RELEASE(mem_pool->heaps);
+    GGML_METAL_RELEASE(mem_pool->heaps_to_remove);
 
     if (size_all > 0) {
         GGML_LOG_DEBUG("%s:   size_all: %.2f MiB\n", __func__, size_all / 1024.0 / 1024.0);
@@ -770,7 +788,7 @@ static void ggml_metal_mem_pool_reset(struct ggml_metal_mem_pool * mem_pool) {
             ggml_metal_heap_free(heap);
 
             [mem_pool->heaps removeObjectAtIndex:index];
-            [ptr release];
+            GGML_METAL_RELEASE(ptr);
 
             if (i == 0) {
                 break;
@@ -1044,13 +1062,13 @@ static id<MTLLibrary> ggml_metal_load_library(id<MTLDevice> device, bool use_bfl
             }
 
 #if !__has_feature(objc_arc)
-            [options release];
+            GGML_METAL_RELEASE(options);
 #endif
         }
     }
 
 #if GGML_METAL_EMBED_LIBRARY
-    [src release];
+    GGML_METAL_RELEASE(src);
 #endif // GGML_METAL_EMBED_LIBRARY
 
     return metal_library;
@@ -1065,7 +1083,7 @@ static struct ggml_backend_metal_context * ggml_metal_init(ggml_backend_dev_t de
     for (id<MTLDevice> device in devices) {
         GGML_LOG_INFO("%s: found device: %s\n", __func__, [[device name] UTF8String]);
     }
-    [devices release]; // since it was created by a *Copy* C method
+    GGML_METAL_RELEASE(devices); // since it was created by a *Copy* C method
 #endif
 
     // init context
@@ -1170,10 +1188,10 @@ static struct ggml_backend_metal_context * ggml_metal_init(ggml_backend_dev_t de
             struct ggml_metal_kernel * kernel = &ctx->kernels[e]; \
             id<MTLFunction> metal_function = [metal_library newFunctionWithName:@"kernel_"#name]; \
             kernel->pipeline = [device newComputePipelineStateWithFunction:metal_function error:&error]; \
-            GGML_LOG_DEBUG("%s: loaded %-40s %16p | th_max = %4d | th_width = %4d\n", __func__, "kernel_"#name, (void *) kernel->pipeline, \
+            GGML_LOG_DEBUG("%s: loaded %-40s %16p | th_max = %4d | th_width = %4d\n", __func__, "kernel_"#name, (__bridge void *) kernel->pipeline, \
                     (int) kernel->pipeline.maxTotalThreadsPerThreadgroup, \
                     (int) kernel->pipeline.threadExecutionWidth); \
-            [metal_function release]; \
+            GGML_METAL_RELEASE(metal_function); \
             if (error) { \
                 GGML_LOG_ERROR("%s: error: load pipeline error: %s\n", __func__, [[error description] UTF8String]); \
                 return NULL; \
@@ -1622,12 +1640,14 @@ static void ggml_metal_free(struct ggml_backend_metal_context * ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
     for (int i = 0; i < GGML_METAL_KERNEL_TYPE_COUNT; ++i) {
-        [ctx->kernels[i].pipeline release];
+        GGML_METAL_RELEASE(ctx->kernels[i].pipeline);
     }
 
-    Block_release(ctx->encode_async);
+    if (ctx->encode_async) {
+        ctx->encode_async = nil;
+    }
 
-    [ctx->queue release];
+    GGML_METAL_RELEASE(ctx->queue);
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         // ctx->cmd_bufs[i].obj is auto released
@@ -1635,7 +1655,7 @@ static void ggml_metal_free(struct ggml_backend_metal_context * ctx) {
         ggml_metal_mem_pool_free(ctx->cmd_bufs[i].mem_pool);
     }
 
-    dispatch_release(ctx->d_queue);
+    ctx->d_queue = nil;
 
     free(ctx);
 }
@@ -1683,11 +1703,11 @@ static bool ggml_backend_metal_buffer_rset_init(
         ctx->rset = [device newResidencySetWithDescriptor:desc error:&error];
         if (error) {
             GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
-            [desc release];
+            GGML_METAL_RELEASE(desc);
             return false;
         }
 
-        [desc release];
+        GGML_METAL_RELEASE(desc);
 
         for (int i = 0; i < ctx->n_buffers; i++) {
             [ctx->rset addAllocation:ctx->buffers[i].metal];
@@ -1713,7 +1733,7 @@ static void ggml_backend_metal_buffer_rset_free(struct ggml_backend_metal_buffer
         if (ctx->rset) {
             [ctx->rset endResidency];
             [ctx->rset removeAllAllocations];
-            [ctx->rset release];
+            GGML_METAL_RELEASE(ctx->rset);
         }
     }
 #else
@@ -6018,7 +6038,7 @@ static void ggml_backend_metal_buffer_free_buffer(ggml_backend_buffer_t buffer) 
     struct ggml_backend_metal_buffer_context * ctx = (struct ggml_backend_metal_buffer_context *)buffer->context;
 
     for (int i = 0; i < ctx->n_buffers; i++) {
-        [ctx->buffers[i].metal release];
+        GGML_METAL_RELEASE(ctx->buffers[i].metal);
     }
 
     ggml_backend_metal_buffer_rset_free(ctx);
@@ -6351,10 +6371,10 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     }
 
     if (ctx->encode_async) {
-        Block_release(ctx->encode_async);
+        ctx->encode_async = nil;
     }
 
-    ctx->encode_async = Block_copy(^(size_t iter) {
+    ctx->encode_async = ^(size_t iter) {
         const int cb_idx = iter;
         const int n_cb_l = ctx->n_cb;
 
@@ -6407,7 +6427,7 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
         }
-    });
+    };
 }
 
 static struct ggml_backend_i ggml_backend_metal_i = {

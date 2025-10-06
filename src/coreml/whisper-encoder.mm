@@ -25,8 +25,8 @@ struct whisper_coreml_context * whisper_coreml_init(const char * path_model) {
     // select which device to run the Core ML model on
     MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
     // config.computeUnits = MLComputeUnitsCPUAndGPU;
-    //config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
-    config.computeUnits = MLComputeUnitsAll;
+    // config.computeUnits = MLComputeUnitsAll;  // 原始配置（混合執行）
+    config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;  // ⚡ 優先使用 ANE 加速 (針對 Breeze-ASR-25 優化)
 
     const void * data = CFBridgingRetain([[whisper_encoder_impl alloc] initWithContentsOfURL:url_model configuration:config error:nil]);
 
@@ -52,9 +52,19 @@ void whisper_coreml_encode(
                              int64_t   n_mel,
                                float * mel,
                                float * out) {
+    NSLog(@"whisper_coreml_encode input shape: 1 x %lld x %lld", n_mel, n_ctx);
+    NSArray<NSNumber *> *inputShape = @[@1, @(n_mel), @(n_ctx)];
+    // 🔧 FIX: Breeze-ASR-25 CoreML 模型使用 "mel" 作為輸入名稱
+    MLMultiArrayConstraint *constraint = [(__bridge id)ctx->data model].modelDescription.inputDescriptionsByName[@"mel"].multiArrayConstraint;
+    NSArray<NSNumber *> *expectedShape = constraint.shape;
+
+    if (![inputShape isEqualToArray:expectedShape]) {
+        NSLog(@"[CoreML] Input shape mismatch: expected %@, actual %@", expectedShape, inputShape);
+    }
+
     MLMultiArray * inMultiArray = [
         [MLMultiArray alloc] initWithDataPointer: mel
-                                           shape: @[@1, @(n_mel), @(n_ctx)]
+                                           shape: inputShape
                                         dataType: MLMultiArrayDataTypeFloat32
                                          strides: @[@(n_ctx*n_mel), @(n_ctx), @1]
                                      deallocator: nil
@@ -62,9 +72,52 @@ void whisper_coreml_encode(
     ];
 
     @autoreleasepool {
-        whisper_encoder_implOutput * outCoreML = [(__bridge id) ctx->data predictionFromLogmel_data:inMultiArray error:nil];
+        NSError *error = nil;
+        // 🔧 FIX: 使用 MLDictionaryFeatureProvider 直接指定正確的 feature 名稱 "mel"
+        // 不依賴自動生成的 predictionFromLogmel_data: 方法（它硬編碼了錯誤的名稱）
+        MLDictionaryFeatureProvider *provider = [[MLDictionaryFeatureProvider alloc]
+            initWithDictionary:@{@"mel": inMultiArray} error:&error];
 
-        memcpy(out, outCoreML.output.dataPointer, outCoreML.output.count * sizeof(float));
+        if (error) {
+            NSLog(@"whisper_coreml_encode feature provider error: %@", error);
+            return;
+        }
+
+        whisper_encoder_impl *model = (__bridge whisper_encoder_impl*) ctx->data;
+        id<MLFeatureProvider> outputFeatures = [model.model predictionFromFeatures:provider error:&error];
+
+        if (error) {
+            NSLog(@"whisper_coreml_encode prediction error: %@", error);
+            if (constraint) {
+                NSLog(@"[CoreML] Model expected shape: %@", expectedShape);
+            }
+            NSLog(@"[CoreML] Provided MLMultiArray shape: %@", inputShape);
+            NSLog(@"[CoreML] Provided strides: %@", @[@(n_ctx*n_mel), @(n_ctx), @1]);
+            return;
+        }
+
+        // 🔧 FIX: Breeze-ASR-25 CoreML 模型輸出名稱為 "encoder_output"
+        MLFeatureValue *outputValue = [outputFeatures featureValueForName:@"encoder_output"];
+        if (!outputValue || outputValue.type != MLFeatureTypeMultiArray) {
+            NSLog(@"whisper_coreml_encode: invalid output feature (expected 'encoder_output')");
+            return;
+        }
+
+        MLMultiArray *outputArray = outputValue.multiArrayValue;
+        NSLog(@"whisper_coreml_encode output shape: %@", outputArray.shape);
+
+        const float *outputPtr = (const float *)outputArray.dataPointer;
+        double sum = 0.0;
+        const NSInteger sampleCount = MIN(10, outputArray.count);
+        NSMutableString *samples = [NSMutableString string];
+        for (NSInteger i = 0; i < sampleCount; ++i) {
+            float value = outputPtr[i];
+            sum += value;
+            [samples appendFormat:@"%0.4f ", value];
+        }
+        NSLog(@"whisper_coreml_encode output first %ld samples: %@ (sum first=%0.4f)", (long)sampleCount, samples, sum);
+
+        memcpy(out, outputPtr, outputArray.count * sizeof(float));
     }
 }
 
