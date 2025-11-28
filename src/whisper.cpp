@@ -3445,12 +3445,25 @@ static std::string whisper_get_coreml_path_encoder(std::string path_bin) {
         path_bin = path_bin.substr(0, pos);
     }
 
-    // match "-qx_x"
+    // remove quantization suffixes (e.g. -q5_0, -q8_0, -q5k)
     pos = path_bin.rfind('-');
     if (pos != std::string::npos) {
-        auto sub = path_bin.substr(pos);
-        if (sub.size() == 5 && sub[1] == 'q' && sub[3] == '_') {
-            path_bin = path_bin.substr(0, pos);
+        auto suffix = path_bin.substr(pos + 1);
+        if (!suffix.empty() && (suffix[0] == 'q' || suffix[0] == 'Q')) {
+            bool is_quant_suffix = true;
+            for (size_t i = 1; i < suffix.size(); ++i) {
+                const char c = suffix[i];
+                if (!(std::isdigit(static_cast<unsigned char>(c)) ||
+                      std::isalpha(static_cast<unsigned char>(c)) ||
+                      c == '_' || c == '-')) {
+                    is_quant_suffix = false;
+                    break;
+                }
+            }
+
+            if (is_quant_suffix) {
+                path_bin = path_bin.substr(0, pos);
+            }
         }
     }
 

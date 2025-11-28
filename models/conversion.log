@@ -1,0 +1,32 @@
+`loss_type=None` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+/Users/jason/miniconda3/envs/breeze-coreml/lib/python3.9/site-packages/transformers/models/whisper/modeling_whisper.py:1016: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if input_features.shape[-1] != expected_seq_length:
+/Users/jason/miniconda3/envs/breeze-coreml/lib/python3.9/site-packages/transformers/models/whisper/modeling_whisper.py:553: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if attn_output.size() != (bsz, self.num_heads, tgt_len, self.head_dim):
+Model is not in eval mode. Consider calling '.eval()' on your model prior to conversion
+Loading HuggingFace model: MediaTek-Research/Breeze-ASR-25
+✅ Loaded HuggingFace model with config:
+   n_audio_ctx: 1500
+   n_mels: 80
+   n_vocab: 51865
+🔧 Encoder input/output configuration:
+   n_audio_ctx (output length): 1500
+   conv_stride: 2
+   mel_length (input length): 3000
+Converting PyTorch Frontend ==> MIL Ops:   0%|          | 0/1119 [00:00<?, ? ops/s]Converting PyTorch Frontend ==> MIL Ops:   4%|▍         | 46/1119 [00:00<00:06, 172.51 ops/s]Converting PyTorch Frontend ==> MIL Ops:  43%|████▎     | 478/1119 [00:00<00:00, 1618.51 ops/s]Converting PyTorch Frontend ==> MIL Ops:  82%|████████▏ | 920/1119 [00:00<00:00, 2548.90 ops/s]Converting PyTorch Frontend ==> MIL Ops: 100%|█████████▉| 1118/1119 [00:00<00:00, 2188.23 ops/s]
+Running MIL frontend_pytorch pipeline:   0%|          | 0/5 [00:00<?, ? passes/s]Running MIL frontend_pytorch pipeline: 100%|██████████| 5/5 [00:00<00:00, 50.40 passes/s]
+Running MIL default pipeline:   0%|          | 0/89 [00:00<?, ? passes/s]Running MIL default pipeline:   7%|▋         | 6/89 [00:00<00:01, 51.16 passes/s]Running MIL default pipeline:  15%|█▍        | 13/89 [00:00<00:01, 57.39 passes/s]Running MIL default pipeline:  21%|██▏       | 19/89 [00:00<00:01, 55.61 passes/s]Running MIL default pipeline:  28%|██▊       | 25/89 [00:00<00:01, 53.01 passes/s]Running MIL default pipeline:  36%|███▌      | 32/89 [00:00<00:01, 56.61 passes/s]Running MIL default pipeline:  43%|████▎     | 38/89 [00:00<00:01, 29.05 passes/s]Running MIL default pipeline:  48%|████▊     | 43/89 [00:01<00:01, 31.84 passes/s]Running MIL default pipeline:  54%|█████▍    | 48/89 [00:01<00:01, 35.16 passes/s]Running MIL default pipeline:  61%|██████    | 54/89 [00:01<00:00, 40.05 passes/s]Running MIL default pipeline:  66%|██████▋   | 59/89 [00:19<00:30,  1.02s/ passes]Running MIL default pipeline:  69%|██████▊   | 61/89 [00:19<00:24,  1.13 passes/s]Running MIL default pipeline:  73%|███████▎  | 65/89 [00:19<00:15,  1.52 passes/s]Running MIL default pipeline:  80%|███████▉  | 71/89 [00:19<00:07,  2.40 passes/s]Running MIL default pipeline:  87%|████████▋ | 77/89 [00:19<00:03,  3.60 passes/s]Running MIL default pipeline:  93%|█████████▎| 83/89 [00:19<00:01,  5.23 passes/s]Running MIL default pipeline:  99%|█████████▉| 88/89 [00:21<00:00,  4.21 passes/s]Running MIL default pipeline: 100%|██████████| 89/89 [00:21<00:00,  4.10 passes/s]
+Running MIL backend_mlprogram pipeline:   0%|          | 0/12 [00:00<?, ? passes/s]Running MIL backend_mlprogram pipeline:  50%|█████     | 6/12 [00:00<00:00, 59.68 passes/s]Running MIL backend_mlprogram pipeline: 100%|██████████| 12/12 [00:00<00:00, 56.83 passes/s]Running MIL backend_mlprogram pipeline: 100%|██████████| 12/12 [00:00<00:00, 57.20 passes/s]
+Quantizing using linear quantization
+Traceback (most recent call last):
+  File "/Users/jason/Developer/taiwan_talka/whisper.cpp/models/convert-whisper-to-coreml.py", line 451, in <module>
+    encoder = convert_encoder(hparams, encoder, quantize=args.quantize)
+  File "/Users/jason/Developer/taiwan_talka/whisper.cpp/models/convert-whisper-to-coreml.py", line 348, in convert_encoder
+    model = quantize_weights(model, nbits=16)
+  File "/Users/jason/miniconda3/envs/breeze-coreml/lib/python3.9/site-packages/coremltools/models/neural_network/quantization_utils.py", line 1695, in quantize_weights
+    quantized_model = _get_model(qspec, compute_units=full_precision_model.compute_unit)
+  File "/Users/jason/miniconda3/envs/breeze-coreml/lib/python3.9/site-packages/coremltools/models/utils.py", line 377, in _get_model
+    return _ct.models.MLModel(spec, compute_units=compute_units)
+  File "/Users/jason/miniconda3/envs/breeze-coreml/lib/python3.9/site-packages/coremltools/models/model.py", line 475, in __init__
+    raise Exception(
+Exception: MLModel of type mlProgram cannot be loaded just from the model spec object. It also needs the path to the weights file. Please provide that as well, using the 'weights_dir' argument.
