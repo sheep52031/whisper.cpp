@@ -24,9 +24,16 @@ struct whisper_coreml_context * whisper_coreml_init(const char * path_model) {
 
     // select which device to run the Core ML model on
     MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
-    // config.computeUnits = MLComputeUnitsCPUAndGPU;
-    // config.computeUnits = MLComputeUnitsAll;  // 原始配置（混合執行）
-    config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;  // ⚡ 優先使用 ANE 加速 (針對 Breeze-ASR-25 優化)
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        config.computeUnits = MLComputeUnitsAll; // Reverted to standard
+        
+        // 🔧 DEBUG: Log compute units
+        NSLog(@"[CoreML] Loading model with MLComputeUnitsAll");  // ⚡ 優先使用 ANE 加速 (針對 Breeze-ASR-25 優化)
+    } else {
+        // Fallback for older OS versions if needed, or just use default
+        config.computeUnits = MLComputeUnitsAll;
+        NSLog(@"[CoreML] Loading model with MLComputeUnitsAll (fallback)");
+    }
 
     const void * data = CFBridgingRetain([[whisper_encoder_impl alloc] initWithContentsOfURL:url_model configuration:config error:nil]);
 
@@ -72,22 +79,21 @@ void whisper_coreml_encode(
     ];
 
     @autoreleasepool {
+        // 3. Create feature provider
+        // The standard model uses "logmel_data" as input
         NSError *error = nil;
-        // 🔧 FIX: 使用 MLDictionaryFeatureProvider 直接指定正確的 feature 名稱 "mel"
-        // 不依賴自動生成的 predictionFromLogmel_data: 方法（它硬編碼了錯誤的名稱）
-        MLDictionaryFeatureProvider *provider = [[MLDictionaryFeatureProvider alloc]
-            initWithDictionary:@{@"mel": inMultiArray} error:&error];
-
-        if (error) {
-            NSLog(@"whisper_coreml_encode feature provider error: %@", error);
+        MLDictionaryFeatureProvider *provider = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{ @"logmel_data" : inMultiArray } error:&error];
+        
+        if (!provider) {
+            NSLog(@"whisper_coreml_encode: error creating feature provider: %@", error);
             return;
         }
 
+        // 4. Prediction
         whisper_encoder_impl *model = (__bridge whisper_encoder_impl*) ctx->data;
         id<MLFeatureProvider> outputFeatures = [model.model predictionFromFeatures:provider error:&error];
-
-        if (error) {
-            NSLog(@"whisper_coreml_encode prediction error: %@", error);
+        if (!outputFeatures) {
+            NSLog(@"whisper_coreml_encode: error during prediction: %@", error);
             if (constraint) {
                 NSLog(@"[CoreML] Model expected shape: %@", expectedShape);
             }
@@ -96,8 +102,11 @@ void whisper_coreml_encode(
             return;
         }
 
-        // 🔧 FIX: Breeze-ASR-25 CoreML 模型輸出名稱為 "encoder_output"
-        MLFeatureValue *outputValue = [outputFeatures featureValueForName:@"encoder_output"];
+        // 5. Get output
+        // The standard model uses "output" or "encoder_output" depending on conversion?
+        // Upstream uses "output" usually, but let's check what my script generated.
+        // My script generated "output".
+        MLFeatureValue *outputValue = [outputFeatures featureValueForName:@"output"];
         if (!outputValue || outputValue.type != MLFeatureTypeMultiArray) {
             NSLog(@"whisper_coreml_encode: invalid output feature (expected 'encoder_output')");
             return;
@@ -106,18 +115,51 @@ void whisper_coreml_encode(
         MLMultiArray *outputArray = outputValue.multiArrayValue;
         NSLog(@"whisper_coreml_encode output shape: %@", outputArray.shape);
 
-        const float *outputPtr = (const float *)outputArray.dataPointer;
-        double sum = 0.0;
-        const NSInteger sampleCount = MIN(10, outputArray.count);
-        NSMutableString *samples = [NSMutableString string];
-        for (NSInteger i = 0; i < sampleCount; ++i) {
-            float value = outputPtr[i];
-            sum += value;
-            [samples appendFormat:@"%0.4f ", value];
+        if (outputArray.dataType == MLMultiArrayDataTypeFloat32) {
+            const float *outputPtr = (const float *)outputArray.dataPointer;
+            memcpy(out, outputPtr, outputArray.count * sizeof(float));
+            
+            // Debug log for first few samples
+            NSMutableString *samples = [NSMutableString string];
+            double sum = 0.0;
+            for (NSInteger i = 0; i < MIN(10, outputArray.count); ++i) {
+                float value = outputPtr[i];
+                sum += value;
+                [samples appendFormat:@"%0.4f ", value];
+            }
+            NSLog(@"whisper_coreml_encode output (Float32) first 10: %@ (sum=%0.4f)", samples, sum);
+            
+        } else if (outputArray.dataType == MLMultiArrayDataTypeFloat16) {
+            // Convert Float16 to Float32
+            // _Float16 is available in C11/C++17, but for ObjC/C we might need to be careful.
+            // CoreML uses standard float16.
+            // We can use __fp16 if supported, or just cast if compiler supports it.
+            // Assuming standard ARM64 environment which supports __fp16.
+            
+            const __fp16 *outputPtr = (const __fp16 *)outputArray.dataPointer;
+            for (NSInteger i = 0; i < outputArray.count; ++i) {
+                out[i] = (float)outputPtr[i];
+            }
+            
+            // Debug log
+            NSMutableString *samples = [NSMutableString string];
+            double sum = 0.0;
+            for (NSInteger i = 0; i < MIN(10, outputArray.count); ++i) {
+                float value = (float)outputPtr[i];
+                sum += value;
+                [samples appendFormat:@"%0.4f ", value];
+            }
+            NSLog(@"whisper_coreml_encode output (Float16 converted) first 10: %@ (sum=%0.4f)", samples, sum);
+            
+        } else if (outputArray.dataType == MLMultiArrayDataTypeDouble) {
+            const double *outputPtr = (const double *)outputArray.dataPointer;
+            for (NSInteger i = 0; i < outputArray.count; ++i) {
+                out[i] = (float)outputPtr[i];
+            }
+             NSLog(@"whisper_coreml_encode output (Double converted)");
+        } else {
+             NSLog(@"whisper_coreml_encode: unsupported data type %ld", (long)outputArray.dataType);
         }
-        NSLog(@"whisper_coreml_encode output first %ld samples: %@ (sum first=%0.4f)", (long)sampleCount, samples, sum);
-
-        memcpy(out, outputPtr, outputArray.count * sizeof(float));
     }
 }
 
