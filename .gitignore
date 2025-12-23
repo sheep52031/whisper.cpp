@@ -64,3 +64,7 @@ cmake-build-debug/
 local.properties
 .log
 .exe
+
+# Breeze-ASR-25 model weights (too large for git)
+models/Breeze-ASR-25-Weights/
+models/coreml-encoder-MediaTek-Research/
