@@ -9,18 +9,15 @@ BREEZE-ASR-25 SPECIALIZED VERSION - whisper.cpp CoreML converter
     Modified: 2025-09-24 for MediaTek-Research/Breeze-ASR-25 compatibility
 
 🎯 KEY MODIFICATIONS FOR BREEZE-ASR-25:
-   1. FIXED: Input tensor name changed from "logmel_data" to "mel" (line 298)
-      - Reason: whisper.cpp expects "mel" input, not "logmel_data"
-      - Fixes: "Feature mel is required but not specified" error
-
-   2. FIXED: Dynamic sequence length support (line 289)
+   1. FIXED: Dynamic sequence length support (line 289)
       - Original: Hard-coded 3000 sequence length (wasteful for Breeze)
       - Fixed: Use hparams.n_audio_ctx (1500 for Breeze-ASR-25)
       - Benefits: Reduced memory usage, correct model dimensions
 
-   3. FIXED: Output tensor name to "encoder_output" (line 301)
-      - Reason: whisper.cpp expects "encoder_output" for hybrid inference
-      - Benefits: Proper CoreML + GGML integration
+   2. INPUT/OUTPUT NAMING: Using whisper.cpp STANDARD names:
+      - Input: "logmel_data" (matches whisper-encoder.mm expectation)
+      - Output: "output" (matches whisper-encoder.mm expectation)
+      - ⚠️ Do NOT use "mel"/"encoder_output" - those are for legacy Breeze models only
 
 🔧 COMPATIBILITY:
    - Breeze-ASR-25: max_source_positions=1500, num_mel_bins=80
@@ -45,6 +42,11 @@ from typing import Dict
 from typing import Optional
 from ane_transformers.reference.layer_norm import LayerNormANE as LayerNormANEBase
 from coremltools.models.neural_network.quantization_utils import quantize_weights
+from coremltools.optimize.coreml import (
+    OpLinearQuantizerConfig,
+    OptimizationConfig,
+    linear_quantize_weights,
+)
 from whisper.model import Whisper, AudioEncoder, TextDecoder, ResidualAttentionBlock, MultiHeadAttention, ModelDimensions
 from whisper import load_model
 
@@ -281,7 +283,7 @@ class WhisperANE(Whisper):
         self.decoder.apply(install_hooks)
         return cache, hooks
 
-def convert_encoder(hparams, model, quantize=False):
+def convert_encoder(hparams, model, quantize=False, quantize_int8=False):
     model.eval()
 
     # 🔧 BREEZE-ASR-25 FIX #1: Calculate correct mel spectrogram input length
@@ -337,21 +339,25 @@ def convert_encoder(hparams, model, quantize=False):
     model = ct.convert(
         traced_model,
         convert_to="mlprogram",
-        # 🔧 BREEZE-ASR-25 FIX #2: Input name "mel" (whisper.cpp expectation)
-        # Original: inputs=[ct.TensorType(name="logmel_data", shape=input_shape)]
-        inputs=[ct.TensorType(name="mel", shape=input_shape)],
-        # 🔧 BREEZE-ASR-25 FIX #3: Output name "encoder_output" (whisper.cpp expectation)
-        # Original: outputs=[ct.TensorType(name="output")]
-        outputs=[ct.TensorType(name="encoder_output")],
+        # Input name MUST be "logmel_data" to match whisper.cpp whisper-encoder.mm
+        inputs=[ct.TensorType(name="logmel_data", shape=input_shape)],
+        # Output name MUST be "output" to match whisper.cpp whisper-encoder.mm
+        outputs=[ct.TensorType(name="output")],
         compute_units=ct.ComputeUnit.ALL,
     )
 
     if quantize:
         model = quantize_weights(model, nbits=16)
+    elif quantize_int8:
+        print("🔨 Quantizing encoder to INT8 (Linear) using ct.optimize.coreml...")
+        config = OptimizationConfig(
+            global_config=OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8", weight_threshold=512)
+        )
+        model = linear_quantize_weights(model, config=config)
 
     return model
 
-def convert_decoder(hparams, model, quantize=False):
+def convert_decoder(hparams, model, quantize=False, quantize_int8=False):
     model.eval()
 
     tokens_shape = (1, 1)
@@ -373,6 +379,9 @@ def convert_decoder(hparams, model, quantize=False):
 
     if quantize:
         model = quantize_weights(model, nbits=16)
+    elif quantize_int8:
+        print("🔨 Quantizing decoder to INT8 (Linear)...")
+        model = quantize_weights(model, nbits=8, quantization_mode="linear")
 
     return model
 
@@ -382,6 +391,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, help="model to convert (e.g. tiny, base, large-v3) or HuggingFace path (e.g. MediaTek-Research/Breeze-ASR-25)", required=True)
     parser.add_argument("--encoder-only", action="store_true", help="only convert encoder")
     parser.add_argument("--quantize", action="store_true", help="quantize weights to F16")
+    parser.add_argument("--quantize-int8", action="store_true", help="quantize weights to INT8 (linear)")
     parser.add_argument("--optimize-ane", action="store_true", help="optimize for ANE execution (currently broken)")
     parser.add_argument("--hf-model", action="store_true", help="load from HuggingFace instead of openai-whisper")
     args = parser.parse_args()
@@ -450,12 +460,12 @@ if __name__ == "__main__":
         decoder = whisper.decoder
 
     # Convert encoder
-    encoder = convert_encoder(hparams, encoder, quantize=args.quantize)
+    encoder = convert_encoder(hparams, encoder, quantize=args.quantize, quantize_int8=args.quantize_int8)
     encoder.save(f"models/coreml-encoder-{args.model}.mlpackage")
 
     if args.encoder_only is False:
         # Convert decoder
-        decoder = convert_decoder(hparams, decoder, quantize=args.quantize)
+        decoder = convert_decoder(hparams, decoder, quantize=args.quantize, quantize_int8=args.quantize_int8)
         decoder.save(f"models/coreml-decoder-{args.model}.mlpackage")
 
     print("done converting")
